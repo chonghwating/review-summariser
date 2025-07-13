@@ -1,0 +1,289 @@
+import requests
+import json
+import time
+from typing import List, Dict, Optional
+import pandas as pd
+from datetime import datetime
+import os
+from transformers import pipeline
+from urllib.parse import urlparse
+import re
+from collections import Counter
+
+class GoogleReviewsAnalyzer:
+    
+    def __init__(self, serpapi_key: str):
+        self.serpapi_key = serpapi_key
+        print(f"Initialized with SerpAPI")
+
+        print("🤖 Loading summarization model...")
+        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        print("✅ Summarizer loaded successfully")
+
+    def search_place(self, query: str) -> Dict:
+        url = "https://serpapi.com/search"
+        params = {
+            "engine": "google_maps",
+            "q": query,
+            "api_key": self.serpapi_key
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            if response.status_code != 200:
+                print(f"❌ HTTP Error {response.status_code}: {response.text}")
+                return {"places": [], "error": f"HTTP {response.status_code}"}
+            
+            data = response.json()
+            if "error" in data:
+                print(f"❌ API Error: {data['error']}")
+                return {"places": [], "error": data["error"]}
+            
+            places = []
+            if "local_results" in data:
+                for place in data["local_results"]:
+                    places.append({
+                        "title": place.get("title", ""),
+                        "place_id": place.get("place_id", ""),
+                        "rating": place.get("rating", 0),
+                        "reviews": place.get("reviews", 0),
+                        "address": place.get("address", ""),
+                        "type": place.get("type", "")
+                    })
+            
+            print(f"✓ Found {len(places)} places")
+            return {"places": places}
+        
+        except requests.RequestException as e:
+            print(f"❌ Network error searching places: {e}")
+            return {"places": [], "error": str(e)}
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode error: {e}")
+            return {"places": [], "error": "Invalid JSON response"}
+
+    def get_reviews_by_place_id(self, place_id: str, max_reviews: int = 50) -> List[Dict]:
+        all_reviews = []
+        next_page_token = None
+        pages_fetched = 0
+        max_pages = max(1, (max_reviews + 7) // 8)
+
+        while len(all_reviews) < max_reviews and pages_fetched < max_pages:
+            url = "https://serpapi.com/search"
+            params = {
+                "engine": "google_maps_reviews",
+                "place_id": place_id,
+                "api_key": self.serpapi_key
+            }
+            if next_page_token:
+                params["next_page_token"] = next_page_token
+
+            try:
+                print(f"📝 Fetching reviews page {pages_fetched + 1} for place ID: {place_id}")
+                response = requests.get(url, params=params, timeout=30)
+
+                if response.status_code != 200:
+                    print(f"❌ HTTP Error {response.status_code}")
+                    break
+
+                data = response.json()
+                if "error" in data:
+                    print(f"❌ API Error: {data['error']}")
+                    break
+
+                page_reviews = []
+                if "reviews" in data:
+                    for review in data["reviews"]:
+                        review_text = review.get("snippet", "") or review.get("text", "")
+                        page_reviews.append({
+                            "place_id": place_id,
+                            "author": review.get("user", {}).get("name", "Anonymous"),
+                            "rating": review.get("rating", 0),
+                            "text": review_text,
+                            "date": review.get("date", ""),
+                            "relative_date": review.get("relative_date", ""),
+                            "likes": review.get("likes", 0),
+                            "source": "Google Reviews (SerpAPI)"
+                        })
+                else:
+                    break
+
+                all_reviews.extend(page_reviews)
+                pages_fetched += 1
+                next_page_token = data.get("search_metadata", {}).get("next_page_token")
+
+                if not next_page_token or len(all_reviews) >= max_reviews:
+                    break
+
+                time.sleep(1)
+
+            except requests.RequestException as e:
+                print(f"❌ Network error fetching reviews: {e}")
+                break
+
+        final_reviews = all_reviews[:max_reviews]
+        print(f"✓ Successfully fetched {len(final_reviews)} reviews total")
+        return final_reviews
+
+    def resolve_google_maps_shortlink(self, short_url: str) -> Optional[str]:
+        try:
+            response = requests.get(short_url, allow_redirects=True, timeout=10)
+            resolved_url = response.url
+            print(f"🔗 Resolved short URL to: {resolved_url}")
+            return resolved_url
+        except requests.RequestException as e:
+            print(f"❌ Failed to resolve short URL: {e}")
+            return None
+
+    def extract_place_name_from_url(self, url: str) -> Optional[str]:
+        if "maps.app.goo.gl" in url:
+            url = self.resolve_google_maps_shortlink(url)
+            if not url:
+                return None
+
+        try:
+            parsed_url = urlparse(url)
+            if "google.com/maps" in parsed_url.netloc:
+                path_parts = parsed_url.path.split('/')
+                if "place" in path_parts:
+                    idx = path_parts.index("place")
+                    if idx + 1 < len(path_parts):
+                        name_part = path_parts[idx + 1]
+                        return name_part.replace('+', ' ').replace('-', ' ')
+            print("⚠️ Could not extract a place name from the URL.")
+            return None
+        except Exception as e:
+            print(f"❌ Error parsing URL: {e}")
+            return None
+
+    def get_reviews_by_query(self, query: str, num_reviews: int = 50) -> List[Dict]:
+        search_results = self.search_place(query)
+
+        if "error" in search_results or not search_results["places"]:
+            print("❌ No places found.")
+            return []
+
+        place = search_results["places"][0]
+        place_id = place["place_id"]
+
+        if not place_id:
+            print("❌ No place ID found.")
+            return []
+
+        print(f"🎯 Selected place: {place['title']} ({place['rating']} ⭐, {place['reviews']} reviews)")
+        print(f"📍 Place ID: {place_id}")
+
+        return self.get_reviews_by_place_id(place_id, num_reviews)
+
+    def combine_reviews_text(self, reviews: List[Dict]) -> str:
+        review_texts = [review['text'] for review in reviews if review['text'].strip()]
+        combined_text = " ".join(review_texts)
+        print(f"📝 Combined {len(review_texts)} reviews into {len(combined_text)} characters")
+        return combined_text
+
+    def summarize_reviews(self, reviews: List[Dict]) -> str:
+        if not reviews:
+            return "No reviews to summarize"
+
+        combined_text = self.combine_reviews_text(reviews)
+
+        if not combined_text.strip():
+            return "No meaningful review content to summarize"
+
+        # Top item extraction
+        keywords = re.findall(r"\b(?:coffee|latte|espresso|cappuccino|toast|sandwich|matcha|cake|tea|avocado|smoothie|croissant|americano|bagel|mocha|frappe|chocolate|cookie|brunch|pasta|drink|dish|burger|salad)\b", combined_text.lower())
+        top_items = [item.capitalize() for item, _ in Counter(keywords).most_common(5)]
+
+        # WFC detection
+        wfc_keywords = ["work", "laptop", "wifi", "power socket", "power plug", "remote", "zoom", "wfc", "working", "quiet", "study"]
+        wfc_found = any(keyword in combined_text.lower() for keyword in wfc_keywords)
+        wfc_status = "✅ Yes" if wfc_found else "❌ No clear mention"
+
+        # Summary generation
+        try:
+            print("🤖 Generating summary...")
+            prompt = f"""Based on these customer reviews, provide an objective summary of the business:
+
+Reviews: {combined_text[:3000]}
+
+Focus on: quality, service, products, customer experience, and overall reputation."""
+            summary_result = self.summarizer(prompt, max_length=200, min_length=50, do_sample=False)
+            summary_body = summary_result[0]['summary_text']
+        except Exception as e:
+            return f"Error generating summary: {str(e)}"
+
+        formatted_top_items = '\n'.join(f"- {item}" for item in top_items) or "Not enough data"
+
+        summary = f"""📋 Summary of the cafe:
+{summary_body}
+
+🥇 Top 5 recommended items:
+{formatted_top_items}
+
+💻 Work-friendly? {wfc_status}"""
+        print("✅ Summary generated successfully")
+        return summary
+
+###################
+##### M A I N #####
+###################
+
+def main():
+    serp_key = os.getenv("SERPAPI")
+    if not serp_key:
+        print("❌ SERPAPI environment variable not found!")
+        serp_key = input("Enter your SerpAPI key: ").strip()
+        if not serp_key:
+            print("❌ No API key provided. Exiting.")
+            return
+
+    print(f"🔑 Using API key: {serp_key[:3]}...")
+
+    analyzer = GoogleReviewsAnalyzer(serp_key)
+
+    print("📍 Paste any Google Maps link (short or full):")
+    maps_url = input("Google Maps link: ").strip()
+
+    place_query = analyzer.extract_place_name_from_url(maps_url)
+    if not place_query:
+        print("❌ Could not extract place name from the URL.")
+        return
+
+    try:
+        num_reviews = int(input("How many reviews would you like to fetch? (e.g. 10): ").strip())
+    except ValueError:
+        print("⚠️ Invalid input. Defaulting to 10.")
+        num_reviews = 10
+
+    print(f"\n🎯 Searching for: {place_query}")
+    print(f"📝 Fetching {num_reviews} reviews...")
+    reviews = analyzer.get_reviews_by_query(place_query, num_reviews)
+
+    if reviews:
+        print(f"\n✅ Found {len(reviews)} reviews!")
+        print("\n📝 All reviews:")
+        for i, review in enumerate(reviews, 1):
+            print(f"\n{i}. {review['author']} ({review['rating']}⭐)")
+            print(f"   Date: {review['date']}")
+            print(f"   Text: {review['text']}")
+
+        print(f"\n{'='*50}")
+        print("📄 REVIEW SUMMARY")
+        print(f"{'='*50}")
+        print(analyzer.summarize_reviews(reviews))
+
+        positive = [r for r in reviews if r['rating'] >= 4]
+        negative = [r for r in reviews if r['rating'] <= 2]
+
+        print(f"\n📊 Quick Analysis:")
+        print(f"   Average Rating: {sum(r['rating'] for r in reviews) / len(reviews):.1f}/5")
+        print(f"   Positive (4-5 stars): {len(positive)}/{len(reviews)} ({len(positive)/len(reviews)*100:.1f}%)")
+        print(f"   Negative (1-2 stars): {len(negative)}/{len(reviews)} ({len(negative)/len(reviews)*100:.1f}%)")
+    else:
+        print("\n❌ No reviews found.")
+        print("💡 This might be due to:")
+        print("   1. No reviews available")
+        print("   2. Reviews are private")
+        print("   3. Temporary API issue")
+
+if __name__ == "__main__":
+    main()
